@@ -379,7 +379,8 @@
     <label>Speed:</label>
     <button class="speed-btn" onclick="setSpeed(0.5)">0.5x</button>
     <button class="speed-btn" onclick="setSpeed(0.75)">0.75x</button>
-    <button class="speed-btn active" onclick="setSpeed(1)">1x</button>
+    <button class="speed-btn active" onclick="setSpeed(0.85)">0.85x</button>
+    <button class="speed-btn" onclick="setSpeed(1)">1x</button>
     <button class="speed-btn" onclick="setSpeed(1.25)">1.25x</button>
   </div>
   <div class="voice-row">
@@ -406,7 +407,7 @@
     <div class="ts-result" id="ts-result">—</div>
     <div class="ts-actions">
       <button class="btn btn-sm btn-outline" onclick="copyTranslation()">📋 Copy</button>
-      <button class="btn btn-sm btn-outline" onclick="speakSelection()">🔊 Read Aloud</button>
+      <button class="btn btn-sm btn-outline" onclick="speakSelection()" style="flex:1">🔊 Play Pronunciation</button>
     </div>
   </div>
 </div>
@@ -436,7 +437,7 @@ let utterance = null;
 let isPlaying = false;
 let isPaused = false;
 let currentWordIndex = 0;
-let speechRate = 1;             // natural speed, like a real person speaking
+let speechRate = 0.85;          // slightly slower for listening practice
 let selectedVoice = null;
 let voices = [];
 let dialogCallback = null;
@@ -445,8 +446,11 @@ let progressTimer = null;
 let speechStartTime = 0;
 let speechDuration = 0;
 
-// Natural speech state (legacy, kept for compatibility)
+// Multi-segment TTS state
+let speechSegments = [];
+let currentSegIndex = 0;
 let speechStopFlag = false;
+let pauseTimerId = null;
 
 // ========== Init ==========
 window.addEventListener('DOMContentLoaded', () => {
@@ -633,7 +637,6 @@ function lookupWordTranslation(word) {
     }
   })();
 }
-
 // ========== Player Bar ==========
 function showPlayerBar(title) {
   document.getElementById('player-bar').classList.add('visible');
@@ -645,65 +648,122 @@ function updatePlayButton() {
   btn.textContent = (isPlaying && !isPaused) ? '⏸' : '▶';
 }
 
-// ========== TTS Engine (single utterance, sequential word matching) ==========
-// Use a shared highlighter to reliably track word-by-word progress
-function makeWordHighlighter(wordSpans, totalWords, spanStartIndex) {
-  let wi = spanStartIndex || 0;
-  return function onBoundary(e) {
-    if (e.name !== 'word') return;
-    wordSpans.forEach(s => s.classList.remove('speaking'));
-    // Use sequential index: each boundary event = next spoken word
-    if (wi < wordSpans.length) {
-      const span = wordSpans[wi];
-      span.classList.add('speaking');
-      span.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      currentWordIndex = parseInt(span.dataset.index);
-      const pct = Math.round(((currentWordIndex + 1) / totalWords) * 100);
-      document.getElementById('progress-fill').style.width = pct + '%';
-      document.getElementById('progress-text').textContent = pct + '%';
-      wi++;
-    }
-  };
+// ========== Multi-Segment TTS Engine (natural pauses + intonation) ==========
+function splitIntoSegments(text) {
+  // Split after punctuation that is followed by whitespace or end-of-string
+  const raw = text.split(/(?<=[.!?;:,])(?=\s|$)|(?<=\n)/).filter(s => s.length > 0);
+  const segments = [];
+  let charOffset = 0;
+
+  for (const seg of raw) {
+    const trimmed = seg.trim();
+    if (!trimmed) { charOffset += seg.length; continue; }
+
+    const lastChar = trimmed.slice(-1);
+    let pauseMs = 100;
+
+    if (/\n/.test(seg))                      pauseMs = 1000;  // paragraph
+    else if (lastChar === '.')                pauseMs = 700;   // period
+    else if (lastChar === '?' || lastChar === '!') pauseMs = 750; // question/exclaim
+    else if (lastChar === ';')                pauseMs = 500;   // semicolon
+    else if (lastChar === ':')                pauseMs = 450;   // colon
+    else if (lastChar === ',')                pauseMs = 350;   // comma
+    else if (/\.\.\.$/.test(trimmed))       pauseMs = 550;   // ellipsis
+    else if (lastChar === '—')                pauseMs = 450;   // em dash
+
+    segments.push({ text: trimmed, charOffset, pauseMs });
+    charOffset += seg.length;
+  }
+  return segments;
+}
+
+function clearPauseTimer() {
+  if (pauseTimerId) { clearTimeout(pauseTimerId); pauseTimerId = null; }
 }
 
 function startSpeech() {
   synth.cancel();
+  clearPauseTimer();
+  speechStopFlag = false;
+
   const wordSpans = document.querySelectorAll('#reading-display .word');
   const totalWords = wordSpans.length;
   if (totalWords === 0) return;
 
-  const utt = new SpeechSynthesisUtterance(currentText);
-  if (selectedVoice) utt.voice = selectedVoice;
-  utt.rate = speechRate;
-  utt.pitch = 1;      // natural pitch
-  utt.volume = 1;
+  // Build segments for natural pauses
+  speechSegments = splitIntoSegments(currentText);
+  currentSegIndex = 0;
 
-  utt.onboundary = makeWordHighlighter(wordSpans, totalWords, 0);
-
-  utt.onend = () => {
-    isPlaying = false; isPaused = false;
-    updatePlayButton();
-    wordSpans.forEach(s => s.classList.remove('speaking'));
-    document.getElementById('progress-fill').style.width = '100%';
-    document.getElementById('progress-text').textContent = '100%';
-    stopProgressTracking();
-    showToast('Playback complete ✓');
-  };
-
-  utt.onerror = (e) => {
-    if (e.error !== 'canceled' && e.error !== 'interrupted') {
-      isPlaying = false; isPaused = false;
-      updatePlayButton();
+  function speakSeg() {
+    if (speechStopFlag || currentSegIndex >= speechSegments.length) {
+      if (!speechStopFlag) {
+        isPlaying = false; isPaused = false;
+        updatePlayButton();
+        wordSpans.forEach(s => s.classList.remove('speaking'));
+        document.getElementById('progress-fill').style.width = '100%';
+        document.getElementById('progress-text').textContent = '100%';
+        stopProgressTracking();
+        showToast('Playback complete ✓');
+      }
+      return;
     }
-  };
+
+    const seg = speechSegments[currentSegIndex];
+    const utt = new SpeechSynthesisUtterance(seg.text);
+    if (selectedVoice) utt.voice = selectedVoice;
+    utt.rate = speechRate;
+    utt.volume = 1;
+
+    // Intonation: pitch varies by sentence ending to convey tone
+    const lastChar = seg.text.slice(-1);
+    if (lastChar === '?')       utt.pitch = 1.12;   // rising for questions
+    else if (lastChar === '!')  utt.pitch = 1.08;   // emphatic
+    else if (lastChar === ',')  utt.pitch = 1.04;   // slight rise (continuation)
+    else                        utt.pitch = 0.97;   // natural baseline
+
+    utt.onboundary = (e) => {
+      if (e.name !== 'word') return;
+      wordSpans.forEach(s => s.classList.remove('speaking'));
+      const absCharIdx = seg.charOffset + e.charIndex;
+      for (const span of wordSpans) {
+        const spanStart = parseInt(span.dataset._startIdx || 0);
+        if (absCharIdx >= spanStart && absCharIdx < spanStart + span.textContent.length) {
+          span.classList.add('speaking');
+          span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          currentWordIndex = parseInt(span.dataset.index);
+          const pct = Math.round(((currentWordIndex + 1) / totalWords) * 100);
+          document.getElementById('progress-fill').style.width = pct + '%';
+          document.getElementById('progress-text').textContent = pct + '%';
+          break;
+        }
+      }
+    };
+
+    utt.onend = () => {
+      currentSegIndex++;
+      const delay = Math.round(seg.pauseMs / Math.max(speechRate, 0.5));
+      pauseTimerId = setTimeout(speakSeg, delay);
+    };
+
+    utt.onerror = (e) => {
+      if (e.error !== 'canceled' && e.error !== 'interrupted') {
+        currentSegIndex++;
+        pauseTimerId = setTimeout(speakSeg, 150);
+      }
+    };
+
+    synth.speak(utt);
+  }
 
   isPlaying = true; isPaused = false;
   updatePlayButton();
-  synth.speak(utt);
+  speakSeg();
   startProgressTracking();
 }
 
 function stopSpeech() {
+  speechStopFlag = true;
+  clearPauseTimer();
   synth.cancel();
   isPlaying = false; isPaused = false;
   updatePlayButton();
@@ -718,40 +778,84 @@ function skipBackward() {
   setTimeout(() => startSpeech(), 150);
 }
 
-// Jump playback to a specific word — speak from that word onward
 function jumpToWord(idx) {
   const wordSpans = document.querySelectorAll('#reading-display .word');
   if (idx >= wordSpans.length) return;
   const charStart = parseInt(wordSpans[idx].dataset._startIdx || 0);
-  const remainingText = currentText.substring(charStart);
+
+  // Find which segment contains this character position
+  speechSegments = splitIntoSegments(currentText);
+  let segIdx = 0;
+  for (let i = 0; i < speechSegments.length; i++) {
+    const segEnd = speechSegments[i].charOffset + speechSegments[i].text.length;
+    if (charStart < segEnd) { segIdx = i; break; }
+    segIdx = i;
+  }
+
+  speechStopFlag = true;
+  clearPauseTimer();
+  synth.cancel();
+
+  // Start from this segment
+  currentSegIndex = segIdx;
+  speechStopFlag = false;
   const totalWords = wordSpans.length;
 
-  synth.cancel();
-  const utt = new SpeechSynthesisUtterance(remainingText);
-  if (selectedVoice) utt.voice = selectedVoice;
-  utt.rate = speechRate; utt.pitch = 1; utt.volume = 1;
-
-  // Start sequential highlight from the target word index
-  utt.onboundary = makeWordHighlighter(wordSpans, totalWords, idx);
-
-  utt.onend = () => {
-    isPlaying = false; isPaused = false;
-    updatePlayButton();
-    wordSpans.forEach(s => s.classList.remove('speaking'));
-    document.getElementById('progress-fill').style.width = '100%';
-    document.getElementById('progress-text').textContent = '100%';
-    stopProgressTracking();
-  };
-
-  utt.onerror = (e) => {
-    if (e.error !== 'canceled' && e.error !== 'interrupted') {
-      isPlaying = false; isPaused = false; updatePlayButton();
+  function speakSeg() {
+    if (speechStopFlag || currentSegIndex >= speechSegments.length) {
+      if (!speechStopFlag) {
+        isPlaying = false; isPaused = false;
+        updatePlayButton();
+        wordSpans.forEach(s => s.classList.remove('speaking'));
+        document.getElementById('progress-fill').style.width = '100%';
+        document.getElementById('progress-text').textContent = '100%';
+        stopProgressTracking();
+      }
+      return;
     }
-  };
+    const seg = speechSegments[currentSegIndex];
+    const utt = new SpeechSynthesisUtterance(seg.text);
+    if (selectedVoice) utt.voice = selectedVoice;
+    utt.rate = speechRate; utt.volume = 1;
+    const lastChar = seg.text.slice(-1);
+    if (lastChar === '?') utt.pitch = 1.12;
+    else if (lastChar === '!') utt.pitch = 1.08;
+    else if (lastChar === ',') utt.pitch = 1.04;
+    else utt.pitch = 0.97;
+
+    utt.onboundary = (e) => {
+      if (e.name !== 'word') return;
+      wordSpans.forEach(s => s.classList.remove('speaking'));
+      const absCharIdx = seg.charOffset + e.charIndex;
+      for (const span of wordSpans) {
+        const spanStart = parseInt(span.dataset._startIdx || 0);
+        if (absCharIdx >= spanStart && absCharIdx < spanStart + span.textContent.length) {
+          span.classList.add('speaking');
+          span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          currentWordIndex = parseInt(span.dataset.index);
+          const pct = Math.round(((currentWordIndex + 1) / totalWords) * 100);
+          document.getElementById('progress-fill').style.width = pct + '%';
+          document.getElementById('progress-text').textContent = pct + '%';
+          break;
+        }
+      }
+    };
+    utt.onend = () => {
+      currentSegIndex++;
+      pauseTimerId = setTimeout(speakSeg, Math.round(seg.pauseMs / Math.max(speechRate, 0.5)));
+    };
+    utt.onerror = (e) => {
+      if (e.error !== 'canceled' && e.error !== 'interrupted') {
+        currentSegIndex++;
+        pauseTimerId = setTimeout(speakSeg, 150);
+      }
+    };
+    synth.speak(utt);
+  }
 
   isPlaying = true; isPaused = false;
   updatePlayButton();
-  synth.speak(utt);
+  speakSeg();
   startProgressTracking();
 }
 
@@ -1036,8 +1140,8 @@ function speakSelection() {
   if (!translateSourceText) return;
   const u = new SpeechSynthesisUtterance(translateSourceText);
   if (selectedVoice) u.voice = selectedVoice;
-  u.rate = Math.max(0.5, speechRate * 0.85);  // slightly slower for word/phrase learning
-  u.pitch = 0.95;
+  u.rate = speechRate;   // use same rate as main playback
+  u.pitch = 1;           // natural pitch for clear pronunciation
   u.volume = 1;
   synth.cancel();
   synth.speak(u);
@@ -1053,6 +1157,7 @@ setInterval(() => {
 // Handle pause/resume correctly with the segment engine
 window.addEventListener('beforeunload', () => {
   synth.cancel();
+  clearPauseTimer();
 });
 </script>
 </body>
