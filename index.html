@@ -379,8 +379,7 @@
     <label>Speed:</label>
     <button class="speed-btn" onclick="setSpeed(0.5)">0.5x</button>
     <button class="speed-btn" onclick="setSpeed(0.75)">0.75x</button>
-    <button class="speed-btn active" onclick="setSpeed(0.85)">0.85x</button>
-    <button class="speed-btn" onclick="setSpeed(1)">1x</button>
+    <button class="speed-btn active" onclick="setSpeed(1)">1x</button>
     <button class="speed-btn" onclick="setSpeed(1.25)">1.25x</button>
   </div>
   <div class="voice-row">
@@ -437,7 +436,7 @@ let utterance = null;
 let isPlaying = false;
 let isPaused = false;
 let currentWordIndex = 0;
-let speechRate = 0.85;        // default: slightly slower for listening practice
+let speechRate = 1;             // natural speed, like a real person speaking
 let selectedVoice = null;
 let voices = [];
 let dialogCallback = null;
@@ -545,7 +544,11 @@ function prepareReading() {
         span.dataset.index = wordIdx;
         span.dataset._startIdx = globalCharPos;   // position in FULL currentText
         span.addEventListener('click', (e) => {
-          if (!window.getSelection().toString()) jumpToWord(wordIdx);
+          // If user is selecting text (for translate bubble), skip
+          if (window.getSelection().toString()) return;
+          e.preventDefault();
+          e.stopPropagation();
+          lookupWordTranslation(seg);
         });
         sRow.appendChild(span);
         globalCharPos += seg.length;
@@ -595,6 +598,42 @@ async function fetchSentenceTranslation(sentence, idx) {
   }
 }
 
+// ========== Click Word to Translate ==========
+function lookupWordTranslation(word) {
+  // Open the bottom sheet with this word/phrase
+  document.getElementById('ts-source').textContent = word;
+  const resultEl = document.getElementById('ts-result');
+  resultEl.className = 'ts-result loading';
+  resultEl.innerHTML = '<div class="spinner"></div> Translating...';
+  translateSourceText = word;
+  translateResultText = '';
+
+  document.getElementById('ts-backdrop').classList.add('open');
+  document.getElementById('ts-sheet').classList.add('open');
+
+  // Fetch translation
+  (async () => {
+    try {
+      const url = 'https://api.mymemory.translated.net/get?q='
+                + encodeURIComponent(word) + '&langpair=en|zh-CN';
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error('Network error');
+      const data = await resp.json();
+      let translated = data.responseData?.translatedText || '';
+      if (translated && translated === translated.toUpperCase() && word !== word.toUpperCase()) {
+        translated = translated.charAt(0).toUpperCase() + translated.slice(1).toLowerCase();
+      }
+      if (!translated) throw new Error('Empty');
+      translateResultText = translated;
+      resultEl.className = 'ts-result';
+      resultEl.textContent = translated;
+    } catch (e) {
+      resultEl.className = 'ts-result error';
+      resultEl.textContent = '⚠️ Translation failed.';
+    }
+  })();
+}
+
 // ========== Player Bar ==========
 function showPlayerBar(title) {
   document.getElementById('player-bar').classList.add('visible');
@@ -606,7 +645,27 @@ function updatePlayButton() {
   btn.textContent = (isPlaying && !isPaused) ? '⏸' : '▶';
 }
 
-// ========== TTS Engine (single utterance for reliable word highlighting) ==========
+// ========== TTS Engine (single utterance, sequential word matching) ==========
+// Use a shared highlighter to reliably track word-by-word progress
+function makeWordHighlighter(wordSpans, totalWords, spanStartIndex) {
+  let wi = spanStartIndex || 0;
+  return function onBoundary(e) {
+    if (e.name !== 'word') return;
+    wordSpans.forEach(s => s.classList.remove('speaking'));
+    // Use sequential index: each boundary event = next spoken word
+    if (wi < wordSpans.length) {
+      const span = wordSpans[wi];
+      span.classList.add('speaking');
+      span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      currentWordIndex = parseInt(span.dataset.index);
+      const pct = Math.round(((currentWordIndex + 1) / totalWords) * 100);
+      document.getElementById('progress-fill').style.width = pct + '%';
+      document.getElementById('progress-text').textContent = pct + '%';
+      wi++;
+    }
+  };
+}
+
 function startSpeech() {
   synth.cancel();
   const wordSpans = document.querySelectorAll('#reading-display .word');
@@ -616,26 +675,10 @@ function startSpeech() {
   const utt = new SpeechSynthesisUtterance(currentText);
   if (selectedVoice) utt.voice = selectedVoice;
   utt.rate = speechRate;
-  utt.pitch = 0.95;   // slightly lower for natural tone
+  utt.pitch = 1;      // natural pitch
   utt.volume = 1;
 
-  utt.onboundary = (e) => {
-    if (e.name !== 'word') return;
-    wordSpans.forEach(s => s.classList.remove('speaking'));
-    const charIdx = e.charIndex;
-    for (const span of wordSpans) {
-      const spanStart = parseInt(span.dataset._startIdx || 0);
-      if (charIdx >= spanStart && charIdx < spanStart + span.textContent.length) {
-        span.classList.add('speaking');
-        span.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        currentWordIndex = parseInt(span.dataset.index);
-        const pct = Math.round(((currentWordIndex + 1) / totalWords) * 100);
-        document.getElementById('progress-fill').style.width = pct + '%';
-        document.getElementById('progress-text').textContent = pct + '%';
-        break;
-      }
-    }
-  };
+  utt.onboundary = makeWordHighlighter(wordSpans, totalWords, 0);
 
   utt.onend = () => {
     isPlaying = false; isPaused = false;
@@ -686,25 +729,10 @@ function jumpToWord(idx) {
   synth.cancel();
   const utt = new SpeechSynthesisUtterance(remainingText);
   if (selectedVoice) utt.voice = selectedVoice;
-  utt.rate = speechRate; utt.pitch = 0.95; utt.volume = 1;
+  utt.rate = speechRate; utt.pitch = 1; utt.volume = 1;
 
-  utt.onboundary = (e) => {
-    if (e.name !== 'word') return;
-    wordSpans.forEach(s => s.classList.remove('speaking'));
-    const absCharIdx = charStart + e.charIndex;
-    for (const span of wordSpans) {
-      const spanStart = parseInt(span.dataset._startIdx || 0);
-      if (absCharIdx >= spanStart && absCharIdx < spanStart + span.textContent.length) {
-        span.classList.add('speaking');
-        span.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        currentWordIndex = parseInt(span.dataset.index);
-        const pct = Math.round(((currentWordIndex + 1) / totalWords) * 100);
-        document.getElementById('progress-fill').style.width = pct + '%';
-        document.getElementById('progress-text').textContent = pct + '%';
-        break;
-      }
-    }
-  };
+  // Start sequential highlight from the target word index
+  utt.onboundary = makeWordHighlighter(wordSpans, totalWords, idx);
 
   utt.onend = () => {
     isPlaying = false; isPaused = false;
