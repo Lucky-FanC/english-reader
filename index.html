@@ -369,9 +369,9 @@
     <label>Speed:</label>
     <button class="speed-btn" onclick="setSpeed(0.5)">0.5x</button>
     <button class="speed-btn" onclick="setSpeed(0.75)">0.75x</button>
-    <button class="speed-btn active" onclick="setSpeed(1)">1x</button>
+    <button class="speed-btn active" onclick="setSpeed(0.85)">0.85x</button>
+    <button class="speed-btn" onclick="setSpeed(1)">1x</button>
     <button class="speed-btn" onclick="setSpeed(1.25)">1.25x</button>
-    <button class="speed-btn" onclick="setSpeed(1.5)">1.5x</button>
   </div>
   <div class="voice-row">
     <label>Voice:</label>
@@ -427,7 +427,7 @@ let utterance = null;
 let isPlaying = false;
 let isPaused = false;
 let currentWordIndex = 0;
-let speechRate = 1;
+let speechRate = 0.85;        // default: slightly slower for listening practice
 let selectedVoice = null;
 let voices = [];
 let dialogCallback = null;
@@ -435,6 +435,13 @@ let currentArticleId = null;
 let progressTimer = null;
 let speechStartTime = 0;
 let speechDuration = 0;
+
+// Natural speech state
+let speechSegments = [];       // array of { text, charOffset, pauseMs }
+let currentSegIndex = 0;
+let speechStopFlag = false;
+let pauseTimerId = null;
+let currentUtterance = null;
 
 // ========== Init ==========
 window.addEventListener('DOMContentLoaded', () => {
@@ -445,23 +452,38 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 });
 
-// ========== Voices ==========
+// ========== Voices (prioritize high-quality neural voices) ==========
 function loadVoices() {
   voices = synth.getVoices().filter(v => v.lang.startsWith('en'));
   const sel = document.getElementById('voice-select');
   sel.innerHTML = '';
-  const preferred = ['en-US', 'en-GB', 'en-AU', 'en-CA'];
-  voices.sort((a, b) => {
-    const ai = preferred.indexOf(a.lang);
-    const bi = preferred.indexOf(b.lang);
-    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
-  });
+
+  // Score voices by quality — neural/enhanced voices sound far more natural
+  function voiceScore(v) {
+    let s = 0;
+    const n = v.name.toLowerCase();
+    // Premium quality indicators
+    if (/neural|enhanced|premium|wavenet|natural/.test(n)) s += 100;
+    if (/google/i.test(v.name))       s += 80;   // Google voices (esp. US English) are excellent
+    if (/microsoft/i.test(v.name))    s += 60;   // Microsoft Neural voices
+    if (/samantha/i.test(v.name))     s += 50;   // Apple's classic good voice
+    if (/daniel|karen|moira/i.test(v.name)) s += 40;
+    // Locale preference
+    if (v.lang === 'en-US') s += 10;
+    if (v.lang === 'en-GB') s += 5;
+    return s;
+  }
+
+  voices.sort((a, b) => voiceScore(b) - voiceScore(a));
+
   voices.forEach((v, i) => {
     const opt = document.createElement('option');
     opt.value = i;
-    opt.textContent = `${v.name} (${v.lang})`;
+    const badge = voiceScore(v) >= 80 ? ' ⭐' : (voiceScore(v) >= 50 ? ' ★' : '');
+    opt.textContent = `${v.name} (${v.lang})${badge}`;
     sel.appendChild(opt);
   });
+
   if (voices.length > 0) {
     selectedVoice = voices[0];
     sel.selectedIndex = 0;
@@ -523,47 +545,98 @@ function updatePlayButton() {
   btn.textContent = (isPlaying && !isPaused) ? '⏸' : '▶';
 }
 
-// ========== TTS ==========
-function togglePlay() {
-  if (!currentText) { prepareReading(); if (!currentText) return; }
-  if (isPlaying && !isPaused) {
-    synth.pause(); isPaused = true;
-    updatePlayButton(); stopProgressTracking(); return;
+// ========== Natural TTS Engine (sentence-aware with pauses) ==========
+
+// Split text into segments with appropriate pause durations
+function splitIntoSegments(text) {
+  // Match: sentence-ending punct → long pause; comma/semi → short pause; paragraph → very long
+  // Regex captures segments including trailing punctuation
+  const raw = text.match(/[^.!?:;\n]+[.!?]+["'"\u201D)?\]]*|[\n]+|[^.!?:;\n]+/g) || [text];
+  const segments = [];
+  let charOffset = 0;
+
+  for (const seg of raw) {
+    const trimmed = seg.trim();
+    if (!trimmed) { charOffset += seg.length; continue; }
+
+    let pauseMs = 150; // default minimal pause
+    const lastChars = seg.replace(/\s+$/, '');
+    const last = lastChars.slice(-1);
+    const prevLast = lastChars.slice(-2, -1);
+
+    if (/\n/.test(seg)) {
+      pauseMs = 900;                                    // paragraph break
+    } else if ('.!?'.includes(last)) {
+      pauseMs = last === '.' ? 550 : 600;               // sentence end
+    } else if (last === ',' || last === ';') {
+      pauseMs = 280;                                     // clause pause
+    } else if (last === ':' || prevLast + last === '..') {
+      pauseMs = 350;                                     // colon / ellipsis
+    } else if (last === '—' || last === '\u2014') {
+      pauseMs = 400;                                     // em dash
+    }
+
+    segments.push({
+      text: trimmed,
+      charOffset,
+      pauseMs
+    });
+    charOffset += seg.length;
   }
-  if (isPaused) {
-    synth.resume(); isPaused = false;
-    updatePlayButton(); startProgressTracking(); return;
-  }
-  startSpeech();
+  return segments;
 }
 
 function startSpeech() {
   synth.cancel();
-  utterance = new SpeechSynthesisUtterance(currentText);
-  if (selectedVoice) utterance.voice = selectedVoice;
-  utterance.rate = speechRate;
-  utterance.pitch = 1;
+  clearPauseTimer();
+  speechStopFlag = false;
 
   const wordSpans = document.querySelectorAll('#reading-display .word');
-  let totalWords = wordSpans.length;
+  const totalWords = wordSpans.length;
 
-  // Pre-calculate start indices
-  let charPos = 0, wIdx2 = 0;
+  // Pre-calculate word start indices
+  let charPos = 0, wIdx = 0;
   for (let i = 0; i < currentWords.length; i++) {
     if (/^\s+$/.test(currentWords[i])) { charPos += currentWords[i].length; continue; }
-    const span = document.querySelector(`.word[data-index="${wIdx2}"]`);
+    const span = document.querySelector(`.word[data-index="${wIdx}"]`);
     if (span) span.dataset._startIdx = charPos;
     charPos += currentWords[i].length;
-    wIdx2++;
+    wIdx++;
   }
 
-  utterance.onboundary = (e) => {
-    if (e.name === 'word') {
+  speechSegments = splitIntoSegments(currentText);
+  currentSegIndex = 0;
+
+  function speakSegment() {
+    if (speechStopFlag || currentSegIndex >= speechSegments.length) {
+      // Done
+      if (!speechStopFlag) {
+        isPlaying = false; isPaused = false;
+        updatePlayButton();
+        wordSpans.forEach(s => s.classList.remove('speaking'));
+        document.getElementById('progress-fill').style.width = '100%';
+        document.getElementById('progress-text').textContent = '100%';
+        stopProgressTracking();
+        showToast('Playback complete ✓');
+      }
+      return;
+    }
+
+    const seg = speechSegments[currentSegIndex];
+    const utt = new SpeechSynthesisUtterance(seg.text);
+    currentUtterance = utt;
+    if (selectedVoice) utt.voice = selectedVoice;
+    utt.rate = speechRate;
+    utt.pitch = 0.95;  // slightly lower pitch sounds more natural
+    utt.volume = 1;
+
+    utt.onboundary = (e) => {
+      if (e.name !== 'word') return;
       wordSpans.forEach(s => s.classList.remove('speaking'));
-      const charIdx = e.charIndex;
+      const absCharIdx = seg.charOffset + e.charIndex;
       for (const span of wordSpans) {
         const spanStart = parseInt(span.dataset._startIdx || 0);
-        if (charIdx >= spanStart && charIdx < spanStart + span.textContent.length) {
+        if (absCharIdx >= spanStart && absCharIdx < spanStart + span.textContent.length) {
           span.classList.add('speaking');
           span.scrollIntoView({ behavior: 'smooth', block: 'center' });
           currentWordIndex = parseInt(span.dataset.index);
@@ -573,37 +646,40 @@ function startSpeech() {
           break;
         }
       }
-    }
-  };
+    };
 
-  utterance.onend = () => {
-    isPlaying = false; isPaused = false;
-    updatePlayButton();
-    wordSpans.forEach(s => s.classList.remove('speaking'));
-    document.getElementById('progress-fill').style.width = '100%';
-    document.getElementById('progress-text').textContent = '100%';
-    stopProgressTracking();
-    showToast('Playback complete ✓');
-  };
+    utt.onend = () => {
+      currentSegIndex++;
+      // Natural pause between segments, scaled by speech rate
+      const delay = Math.round(seg.pauseMs / speechRate);
+      pauseTimerId = setTimeout(speakSegment, delay);
+    };
 
-  utterance.onerror = (e) => {
-    if (e.error !== 'canceled') {
-      isPlaying = false; isPaused = false;
-      updatePlayButton();
-      showToast('Speech error: ' + e.error);
-    }
-  };
+    utt.onerror = (e) => {
+      if (e.error !== 'canceled' && e.error !== 'interrupted') {
+        console.warn('TTS segment error:', e.error);
+        // Try next segment instead of stopping
+        currentSegIndex++;
+        pauseTimerId = setTimeout(speakSegment, 200);
+      }
+    };
 
-  const wordCount = wordSpans.length;
-  speechDuration = (wordCount / (150 * speechRate)) * 60 * 1000;
-  speechStartTime = Date.now();
+    synth.speak(utt);
+  }
+
   isPlaying = true; isPaused = false;
   updatePlayButton();
-  synth.speak(utterance);
+  speakSegment();
   startProgressTracking();
 }
 
+function clearPauseTimer() {
+  if (pauseTimerId) { clearTimeout(pauseTimerId); pauseTimerId = null; }
+}
+
 function stopSpeech() {
+  speechStopFlag = true;
+  clearPauseTimer();
   synth.cancel();
   isPlaying = false; isPaused = false;
   updatePlayButton();
@@ -615,27 +691,62 @@ function stopSpeech() {
 
 function skipBackward() {
   stopSpeech();
-  setTimeout(() => startSpeech(), 100);
+  setTimeout(() => startSpeech(), 150);
 }
 
+// Jump playback to a specific word — find which segment contains it and start from there
 function jumpToWord(idx) {
   const wordSpans = document.querySelectorAll('#reading-display .word');
   if (idx >= wordSpans.length) return;
-  let charStart = parseInt(wordSpans[idx].dataset._startIdx || 0);
-  const remainingText = currentText.substring(charStart);
+  const charStart = parseInt(wordSpans[idx].dataset._startIdx || 0);
+
+  // Find which segment contains this character position
+  let segIdx = 0;
+  for (let i = 0; i < speechSegments.length; i++) {
+    const seg = speechSegments[i];
+    const segEnd = seg.charOffset + seg.text.length;
+    if (charStart >= seg.charOffset && charStart < segEnd) { segIdx = i; break; }
+    if (charStart < segEnd) { segIdx = i; break; }
+    segIdx = i;
+  }
+
+  speechStopFlag = true;
+  clearPauseTimer();
   synth.cancel();
-  utterance = new SpeechSynthesisUtterance(remainingText);
-  if (selectedVoice) utterance.voice = selectedVoice;
-  utterance.rate = speechRate;
+
+  // Rebuild segments from the target segment onward
+  speechSegments = speechSegments.slice(segIdx);
+  currentSegIndex = 0;
+  speechStopFlag = false;
+
+  // Restart speaking from this segment
   const totalWords = wordSpans.length;
 
-  utterance.onboundary = (e) => {
-    if (e.name === 'word') {
+  function speakSeg() {
+    if (speechStopFlag || currentSegIndex >= speechSegments.length) {
+      if (!speechStopFlag) {
+        isPlaying = false; isPaused = false;
+        updatePlayButton();
+        wordSpans.forEach(s => s.classList.remove('speaking'));
+        document.getElementById('progress-fill').style.width = '100%';
+        document.getElementById('progress-text').textContent = '100%';
+        stopProgressTracking();
+      }
+      return;
+    }
+    const seg = speechSegments[currentSegIndex];
+    const utt = new SpeechSynthesisUtterance(seg.text);
+    currentUtterance = utt;
+    if (selectedVoice) utt.voice = selectedVoice;
+    utt.rate = speechRate; utt.pitch = 0.95; utt.volume = 1;
+
+    utt.onboundary = (e) => {
+      if (e.name !== 'word') return;
       wordSpans.forEach(s => s.classList.remove('speaking'));
-      const charIdx = charStart + e.charIndex;
+      const absCharIdx = seg.charOffset + e.charIndex;
       for (const span of wordSpans) {
         const spanStart = parseInt(span.dataset._startIdx || 0);
-        if (charIdx >= spanStart && charIdx < spanStart + span.textContent.length) {
+        if (absCharIdx >= spanStart && absCharIdx < spanStart + span.textContent.length) {
           span.classList.add('speaking');
           span.scrollIntoView({ behavior: 'smooth', block: 'center' });
           currentWordIndex = parseInt(span.dataset.index);
@@ -645,22 +756,23 @@ function jumpToWord(idx) {
           break;
         }
       }
-    }
-  };
-  utterance.onend = () => {
-    isPlaying = false; isPaused = false;
-    updatePlayButton();
-    wordSpans.forEach(s => s.classList.remove('speaking'));
-    document.getElementById('progress-fill').style.width = '100%';
-    document.getElementById('progress-text').textContent = '100%';
-    stopProgressTracking();
-  };
-  utterance.onerror = (e) => {
-    if (e.error !== 'canceled') { isPlaying = false; isPaused = false; updatePlayButton(); }
-  };
+    };
+    utt.onend = () => {
+      currentSegIndex++;
+      pauseTimerId = setTimeout(speakSeg, Math.round(seg.pauseMs / speechRate));
+    };
+    utt.onerror = (e) => {
+      if (e.error !== 'canceled' && e.error !== 'interrupted') {
+        currentSegIndex++;
+        pauseTimerId = setTimeout(speakSeg, 200);
+      }
+    };
+    synth.speak(utt);
+  }
+
   isPlaying = true; isPaused = false;
   updatePlayButton();
-  synth.speak(utterance);
+  speakSeg();
   startProgressTracking();
 }
 
@@ -676,6 +788,20 @@ function seekProgress(e) {
   const wordSpans = document.querySelectorAll('#reading-display .word');
   const targetIdx = Math.floor(pct * wordSpans.length);
   jumpToWord(Math.max(0, Math.min(targetIdx, wordSpans.length - 1)));
+}
+
+// ========== TTS Controls ==========
+function togglePlay() {
+  if (!currentText) { prepareReading(); if (!currentText) return; }
+  if (isPlaying && !isPaused) {
+    synth.pause(); clearPauseTimer(); isPaused = true;
+    updatePlayButton(); stopProgressTracking(); return;
+  }
+  if (isPaused) {
+    synth.resume(); isPaused = false;
+    updatePlayButton(); startProgressTracking(); return;
+  }
+  startSpeech();
 }
 
 // ========== Speed ==========
@@ -931,7 +1057,9 @@ function speakSelection() {
   if (!translateSourceText) return;
   const u = new SpeechSynthesisUtterance(translateSourceText);
   if (selectedVoice) u.voice = selectedVoice;
-  u.rate = Math.max(0.5, speechRate * 0.85);
+  u.rate = Math.max(0.5, speechRate * 0.85);  // slightly slower for word/phrase learning
+  u.pitch = 0.95;
+  u.volume = 1;
   synth.cancel();
   synth.speak(u);
 }
@@ -943,8 +1071,10 @@ setInterval(() => {
   }
 }, 10000);
 
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden && isPlaying) { /* keep playing */ }
+// Handle pause/resume correctly with the segment engine
+window.addEventListener('beforeunload', () => {
+  synth.cancel();
+  clearPauseTimer();
 });
 </script>
 </body>
