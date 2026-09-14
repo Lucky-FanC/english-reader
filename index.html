@@ -650,7 +650,7 @@ function updatePlayButton() {
 
 // ========== Multi-Segment TTS Engine (natural pauses + intonation) ==========
 function splitIntoSegments(text) {
-  // Split after punctuation that is followed by whitespace or end-of-string
+  // Split after ALL punctuation and newlines for natural pauses
   const raw = text.split(/(?<=[.!?;:,])(?=\s|$)|(?<=\n)/).filter(s => s.length > 0);
   const segments = [];
   let charOffset = 0;
@@ -660,16 +660,15 @@ function splitIntoSegments(text) {
     if (!trimmed) { charOffset += seg.length; continue; }
 
     const lastChar = trimmed.slice(-1);
-    let pauseMs = 100;
+    let pauseMs;
 
-    if (/\n/.test(seg))                      pauseMs = 1000;  // paragraph
-    else if (lastChar === '.')                pauseMs = 700;   // period
-    else if (lastChar === '?' || lastChar === '!') pauseMs = 750; // question/exclaim
-    else if (lastChar === ';')                pauseMs = 500;   // semicolon
-    else if (lastChar === ':')                pauseMs = 450;   // colon
-    else if (lastChar === ',')                pauseMs = 350;   // comma
-    else if (/\.\.\.$/.test(trimmed))       pauseMs = 550;   // ellipsis
-    else if (lastChar === '—')                pauseMs = 450;   // em dash
+    if (/\n/.test(seg))                             pauseMs = 1500;  // paragraph
+    else if (lastChar === '?' || lastChar === '!')   pauseMs = 1400;  // ? !
+    else if (lastChar === '.')                       pauseMs = 1200;  // period
+    else if (lastChar === ';')                       pauseMs = 800;   // semicolon
+    else if (lastChar === ':')                       pauseMs = 700;   // colon
+    else if (lastChar === ',')                       pauseMs = 550;   // comma
+    else                                             pauseMs = 400;   // fallback
 
     segments.push({ text: trimmed, charOffset, pauseMs });
     charOffset += seg.length;
@@ -718,7 +717,8 @@ function startSpeech() {
     const lastChar = seg.text.slice(-1);
     if (lastChar === '?')       utt.pitch = 1.12;   // rising for questions
     else if (lastChar === '!')  utt.pitch = 1.08;   // emphatic
-    else if (lastChar === ',')  utt.pitch = 1.04;   // slight rise (continuation)
+    else if (lastChar === ',')  utt.pitch = 1.05;   // slight rise (continuation)
+    else if (lastChar === ';')  utt.pitch = 1.03;   // soft continuation
     else                        utt.pitch = 0.97;   // natural baseline
 
     utt.onboundary = (e) => {
@@ -820,7 +820,8 @@ function jumpToWord(idx) {
     const lastChar = seg.text.slice(-1);
     if (lastChar === '?') utt.pitch = 1.12;
     else if (lastChar === '!') utt.pitch = 1.08;
-    else if (lastChar === ',') utt.pitch = 1.04;
+    else if (lastChar === ',') utt.pitch = 1.05;
+    else if (lastChar === ';') utt.pitch = 1.03;
     else utt.pitch = 0.97;
 
     utt.onboundary = (e) => {
@@ -840,15 +841,16 @@ function jumpToWord(idx) {
         }
       }
     };
-    utt.onend = () => {
+    let segDone = false;
+    function next() {
+      if (segDone) return;
+      segDone = true;
       currentSegIndex++;
-      pauseTimerId = setTimeout(speakSeg, Math.round(seg.pauseMs / Math.max(speechRate, 0.5)));
-    };
+      pauseTimerId = setTimeout(speakSeg, Math.max(600, Math.round(seg.pauseMs / speechRate)));
+    }
+    utt.onend = next;
     utt.onerror = (e) => {
-      if (e.error !== 'canceled' && e.error !== 'interrupted') {
-        currentSegIndex++;
-        pauseTimerId = setTimeout(speakSeg, 150);
-      }
+      if (e.error !== 'canceled' && e.error !== 'interrupted') next();
     };
     synth.speak(utt);
   }
